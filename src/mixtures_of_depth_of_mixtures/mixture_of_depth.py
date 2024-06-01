@@ -77,8 +77,8 @@ class MixtureOfDepth(nn.Module):
         weights = self.router(hidden_states).squeeze(-1)
 
         k = int(capa * s)
-        top_k_values, k_indexes = torch.topk(weights, k, dim=1, sorted=True)
-        threshold = top_k_values[:, -1]  # what is this even?
+        top_k_values, k_idxs = torch.topk(weights, k, dim=1, sorted=True)
+        threshold = top_k_values[:, -1]
         selected_mask = weights > threshold.unsqueeze(-1)
 
         cache = None
@@ -119,7 +119,6 @@ class MixtureOfDepth(nn.Module):
             # I believe i verified all of this but spent way too long figuring this bit out.  very frustrating
             # to make sure in future, im leaving the `_verify_selected_causal_mask(attention_mask, selected_mask)` which
             # i am more sure is correct and that should equal current_causal_mask
-
             if mask_s != selected_tokens.shape[1]:
                 raise ValueError("The attention mask should have the same number of tokens as the selected tokens")
         else:
@@ -146,8 +145,8 @@ class MixtureOfDepth(nn.Module):
                 **kwargs,
             )
 
-        if len(hidden_states) == 2:
-            hidden_states, cache = hidden_states
+            if len(hidden_states) == 2:
+                hidden_states, cache = hidden_states
 
         # feel like the better way to do this is use scatter_add but then you need indexes as int, and I am frankly
         # kind of confused by how the indexing of this stuff works when you get to 4D tensors.
