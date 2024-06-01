@@ -55,6 +55,32 @@ class MixtureOfDepth(nn.Module):
             return [arg.to(device) if arg is not None else None for arg in args]
         return args
 
+    def _make_selected_attention_mask(self, attention_mask, selected_mask):
+        if attention_mask is not None:
+            if (attention_mask.ndim == 4) and (attention_mask.shape[1] != 1):
+                raise ValueError("I only tested this when the attention mask 4dim has 1 as the second dim")
+
+            # has taken me an insanely long time to figure this out..., the attention mask is likely to be
+            #       [batch_size, 1, seq_len, seq_len]
+            # the first mask we take, we must reshape with -1 in 1st dim as that corresponds to the new seq len
+            # from there the last dim will be original seq len
+            current_causal_mask = attention_mask[selected_mask[:, None]].view(b, -1, s)
+            # the mask_s is the new seq len, the original seq len is the last dim, it is the same as the new seq length
+            # of selected tensors above but it is easier to understand the masking if i keep it shown here
+            mask_s = current_causal_mask.shape[1]
+            # from here we need to select the causal mask along the last dim (the s from above) but this requires us to
+            # Tensor.expand along the dim we already masked along.
+            current_causal_mask = current_causal_mask[selected_mask[:, None].expand(-1, mask_s, -1)]
+            # then lastly we need to reshape it since taking the mask along multiple dims causes you to lose
+            # dims with boolean masking
+            current_causal_mask = current_causal_mask.view(b, 1, mask_s, mask_s)
+            # I believe i verified all of this but spent way too long figuring this bit out.  very frustrating
+            # to make sure in future, im leaving the `_verify_selected_causal_mask(attention_mask, selected_mask)` which
+            # i am more sure is correct and that should equal current_causal_mask
+        else:
+            current_causal_mask = None
+        return current_causal_mask, mask_s
+
     def forward(
         self,
         hidden_states: torch.Tensor,
@@ -98,31 +124,10 @@ class MixtureOfDepth(nn.Module):
         # the batch dimension to be the same as the selected_tokens
         selected_position_ids = torch.masked_select(position_ids, selected_mask).view(b, -1)
 
-        if attention_mask is not None:
-            if (attention_mask.ndim == 4) and (attention_mask.shape[1] != 1):
-                raise ValueError("I only tested this when the attention mask 4dim has 1 as the second dim")
+        current_causal_mask, mask_s = self._make_selected_attention_mask(attention_mask, selected_mask)
 
-            # has taken me an insanely long time to figure this out..., the attention mask is likely to be
-            #       [batch_size, 1, seq_len, seq_len]
-            # the first mask we take, we must reshape with -1 in 1st dim as that corresponds to the new seq len
-            # from there the last dim will be original seq len
-            current_causal_mask = attention_mask[selected_mask[:, None]].view(b, -1, s)
-            # the mask_s is the new seq len, the original seq len is the last dim, it is the same as the new seq length
-            # of selected tensors above but it is easier to understand the masking if i keep it shown here
-            mask_s = current_causal_mask.shape[1]
-            # from here we need to select the causal mask along the last dim (the s from above) but this requires us to
-            # Tensor.expand along the dim we already masked along.
-            current_causal_mask = current_causal_mask[selected_mask[:, None].expand(-1, mask_s, -1)]
-            # then lastly we need to reshape it since taking the mask along multiple dims causes you to lose
-            # dims with boolean masking
-            current_causal_mask = current_causal_mask.view(b, 1, mask_s, mask_s)
-            # I believe i verified all of this but spent way too long figuring this bit out.  very frustrating
-            # to make sure in future, im leaving the `_verify_selected_causal_mask(attention_mask, selected_mask)` which
-            # i am more sure is correct and that should equal current_causal_mask
-            if mask_s != selected_tokens.shape[1]:
-                raise ValueError("The attention mask should have the same number of tokens as the selected tokens")
-        else:
-            current_causal_mask = None
+        if mask_s != selected_tokens.shape[1]:
+            raise ValueError("The attention mask should have the same number of tokens as the selected tokens")
 
         if cache_position is not None:
             if not self._skip_position_ids:
@@ -155,16 +160,18 @@ class MixtureOfDepth(nn.Module):
         # the indexes along the embed dim
         output[selected_mask] = (hidden_states * weights[selected_mask].view(b, -1, 1)).view(-1, d)
         output = output + (hidden_states * (~selected_mask[..., None]).to(hidden_states.dtype))
-        return (output, cache) if cache is not None else (output,)
+
+        output = (output,)
+
+        if cache:
+            output += (cache,)
+
+        return output
 
 
 def _mod_func(mod: nn.Module):
-    # _archs = "BloomForCausalLM", "FalconMoDForCausalLM"
     if hasattr(mod, "language_model"):  # for multimodal like fuyu models in general
-        ret_mod, ret_settr = (
-            mod.language_model.model.layers,
-            partial(setattr, mod.language_model.model, "layers"),
-        )
+        ret_mod, ret_settr = mod.language_model.model.layers, partial(setattr, mod.language_model.model, "layers")
     elif hasattr(mod, "model"):  # for GPT models
         ret_mod, ret_settr = mod.model.layers, partial(setattr, mod.model, "layers")
     elif hasattr(mod, "transformers"):  # for ??? models
